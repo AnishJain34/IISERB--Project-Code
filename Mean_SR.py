@@ -38,6 +38,117 @@ def mean_ci(series):
     return mean, ci, n
 
 
+from scipy.stats import t
+
+
+def descriptive_stats(series):
+    """Calculate N, mean, SD and two-sided 95% CI."""
+    values = pd.to_numeric(series, errors="coerce").dropna()
+
+    n = len(values)
+    if n == 0:
+        return {
+            "n": 0, "mean": np.nan, "sd": np.nan,
+            "ci_low": np.nan, "ci_high": np.nan
+        }
+
+    mean = values.mean()
+    sd = values.std(ddof=1) if n > 1 else np.nan
+
+    if n > 1:
+        se = sd / np.sqrt(n)
+        critical = t.ppf(0.975, df=n - 1)
+        ci_low = mean - critical * se
+        ci_high = mean + critical * se
+    else:
+        ci_low = ci_high = np.nan
+
+    return {
+        "n": n,
+        "mean": mean,
+        "sd": sd,
+        "ci_low": ci_low,
+        "ci_high": ci_high
+    }
+
+
+def save_latex_table(df):
+    """Create publication-ready LaTeX table for SUDS and DASS-21."""
+
+    measures = [
+        ("SUDS after Baseline", "SUDS_beforeExp"),
+        ("SUDS after 2-Back", "SUDS_afterExp"),
+        ("SUDS after Speech/Rest", "SUDS_afterAct"),
+        ("DASS-21 Depression", "Depression_Score"),
+        ("DASS-21 Anxiety", "Anxiety_Score"),
+        ("DASS-21 Stress", "Stress_Score"),
+    ]
+
+    rows = []
+
+    for label, column in measures:
+        stats = descriptive_stats(df[column])
+
+        rows.append({
+            "Measure": label,
+            "n": stats["n"],
+            "Mean": stats["mean"],
+            "SD": stats["sd"],
+            "95% CI": (
+                f"[{stats['ci_low']:.2f}, "
+                f"{stats['ci_high']:.2f}]"
+                if stats["n"] > 1 else "--"
+            )
+        })
+
+    summary = pd.DataFrame(rows)
+
+    # Save complete numerical results
+    summary.to_csv(
+        OUTPUT_DIR / "SUDS_DASS_Descriptive_Statistics.csv",
+        index=False
+    )
+
+    # Generate LaTeX table
+    latex_lines = [
+        r"\begin{tabular}{lrrrr}",
+        r"\toprule",
+        r"\textbf{Measure} & \textbf{$n$} & "
+        r"\textbf{Mean} & \textbf{SD} & "
+        r"\textbf{95\% CI} \\",
+        r"\midrule"
+    ]
+
+    for _, row in summary.iterrows():
+        mean = f"{row['Mean']:.1f}" if pd.notna(row["Mean"]) else "--"
+        sd = f"{row['SD']:.2f}" if pd.notna(row["SD"]) else "--"
+
+        latex_lines.append(
+            f"{row['Measure']} & "
+            f"{row['n']} & "
+            f"{mean} & "
+            f"{sd} & "
+            f"{row['95% CI']} \\\\"
+        )
+
+    latex_lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}"
+    ])
+
+    latex_path = OUTPUT_DIR / "SUDS_DASS_Descriptive_Table.tex"
+
+    with open(latex_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(latex_lines))
+
+    print("\nDescriptive Statistics:")
+    print(summary.to_string(index=False))
+
+    print(f"\nSaved CSV: {OUTPUT_DIR / 'SUDS_DASS_Descriptive_Statistics.csv'}")
+    print(f"Saved LaTeX: {latex_path}")
+
+    return summary
+
 def style_axis(ax):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -309,17 +420,116 @@ def save_summary(df):
     return summary
 
 
+def figure4_baseline_speech_rest(df):
+    """
+    Panel A: Baseline vs Speech (Stressed condition)
+    Panel B: Baseline vs Rest (Control condition)
+    Mean SUDS with 95% CI
+    """
+
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(12, 5.5), dpi=300
+    )
+
+    panels = [
+        (ax1, "Stressed", "Speech Activity"),
+        (ax2, "Control", "Rest Activity")
+    ]
+
+    for ax, condition, activity in panels:
+
+        sub = df[df["Condition"] == condition].copy()
+
+        # Keep participants with both measurements
+        sub = sub.dropna(
+            subset=["SUDS_beforeExp", "SUDS_afterAct"]
+        )
+
+        baseline_mean, baseline_ci, n1 = mean_ci(
+            sub["SUDS_beforeExp"]
+        )
+
+        activity_mean, activity_ci, n2 = mean_ci(
+            sub["SUDS_afterAct"]
+        )
+
+        means = [baseline_mean, activity_mean]
+        cis = [baseline_ci, activity_ci]
+        ns = [n1, n2]
+
+        x = np.arange(2)
+
+        bars = ax.bar(
+            x, means,
+            width=0.55,
+            color=[NSA_COLOR, SA_COLOR],
+            yerr=cis,
+            capsize=6,
+            edgecolor="black",
+            linewidth=0.5,
+            zorder=3
+        )
+
+        add_labels(ax, bars, means, cis, ns, offset=1)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(
+            ["Baseline", activity],
+            fontsize=10
+        )
+
+        ax.set_ylabel("Mean SUDS score (0–100)")
+        ax.set_title(
+            f"{activity} (n={len(sub)})",
+            fontsize=12
+        )
+
+        ax.set_ylim(0, 100)
+        style_axis(ax)
+
+    fig.suptitle(
+        "Self-reported distress: Baseline vs Speech/Rest",
+        fontsize=14
+    )
+
+    fig.text(
+        0.02, 0.01,
+        "Error bars represent 95% confidence intervals. "
+        "Speech corresponds to Stressed condition; "
+        "Rest corresponds to Control condition.",
+        fontsize=8
+    )
+
+    fig.tight_layout(rect=[0, 0.05, 1, 0.94])
+
+    path = OUTPUT_DIR / "fig4_baseline_speech_rest_suds.png"
+
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+
+    print(f"Saved: {path}")
+
+    if SHOW_FIGURES:
+        plt.show()
+
+    plt.close(fig)
+
 def main():
     print(f"Input CSV: {CSV_PATH}")
     print(f"Output folder: {OUTPUT_DIR}")
+
     df = load_data()
+
     figure1_sias(df)
     figure2_overall(df)
     figure3_group_comparison(df)
+    figure4_baseline_speech_rest(df)
     summary = save_summary(df)
-    print("\nSummary statistics:")
-    print(summary.to_string(index=False))
-    print("\nCompleted. Check the output folder for all figures and CSV reports.")
+
+    # NEW: SD + 95% CI + publication-ready LaTeX table
+    descriptive_table = save_latex_table(df)
+
+    print("\nCompleted.")
+    print("Check the output folder for figures, CSV reports, and LaTeX table.")
 
 
 if __name__ == "__main__":
