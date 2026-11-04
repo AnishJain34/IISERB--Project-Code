@@ -420,98 +420,117 @@ def save_summary(df):
     return summary
 
 
-def figure4_baseline_speech_rest(df):
-    """
-    Panel A: Baseline vs Speech (Stressed condition)
-    Panel B: Baseline vs Rest (Control condition)
-    Mean SUDS with 95% CI
-    """
+def figure4_mean_sr_stressed(df):
+    stressed = df[df["Condition"] == "Stressed"].copy()
 
-    fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(12, 5.5), dpi=300
+    cols = ["SUDS_beforeExp", "SUDS_afterExp", "SUDS_afterAct"]
+    labels = ["Baseline", "After 2-Back", "After Speech/Activity"]
+
+    data = stressed[cols].apply(pd.to_numeric, errors="coerce")
+    means = np.array([
+    mean_ci(data[col])[0] for col in cols
+])
+
+    ci = np.array([
+    mean_ci(data[col])[1] for col in cols
+])
+
+
+    plt.figure(figsize=(8, 5))
+    plt.errorbar(
+        labels, means, yerr=ci,
+        marker="o", capsize=5, linewidth=2,
+        color="#D55E00"
+    )
+    plt.ylabel("Mean SR (SUDS)")
+    plt.xlabel("Experimental Phase")
+    plt.title(f"Mean SR – Stressed Group (n={len(stressed)})")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "fig4_mean_sr_stressed.png", dpi=300)
+    plt.close()
+
+
+def figure5_mean_sr_rest(df):
+    rest = df[df["Condition"] == "Control"].copy()
+
+    cols = ["SUDS_beforeExp", "SUDS_afterExp", "SUDS_afterAct"]
+    labels = ["Baseline", "After 2-Back", "After Rest"]
+
+    data = rest[cols].apply(pd.to_numeric, errors="coerce")
+    means = np.array([
+        mean_ci(data[col])[0] for col in cols
+    ])
+    
+    ci = np.array([
+        mean_ci(data[col])[1] for col in cols
+    ])
+
+    plt.figure(figsize=(8, 5))
+    plt.errorbar(
+        labels, means, yerr=ci,
+        marker="o", capsize=5, linewidth=2,
+        color="#0072B2"
+    )
+    plt.ylabel("Mean SR (SUDS)")
+    plt.xlabel("Experimental Phase")
+    plt.title(f"Mean SR – Rest/Control Group (n={len(rest)})")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "fig5_mean_sr_rest.png", dpi=300)
+    plt.close()
+
+
+def figure6_mean_sr_comparison(df):
+    cols = ["SUDS_beforeExp", "SUDS_afterExp", "SUDS_afterAct"]
+    labels = ["Baseline", "After 2-Back", "After Activity/Rest"]
+
+    stressed = df[df["Condition"] == "Stressed"][cols].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    rest = df[df["Condition"] == "Control"][cols].apply(
+        pd.to_numeric, errors="coerce"
     )
 
-    panels = [
-        (ax1, "Stressed", "Speech Activity"),
-        (ax2, "Control", "Rest Activity")
-    ]
+    stressed_means = np.array([
+    mean_ci(stressed[col])[0] for col in cols
+])
 
-    for ax, condition, activity in panels:
+    rest_means = np.array([
+    mean_ci(rest[col])[0] for col in cols
+])
 
-        sub = df[df["Condition"] == condition].copy()
+    stressed_ci = np.array([
+    mean_ci(stressed[col])[1] for col in cols
+])
 
-        # Keep participants with both measurements
-        sub = sub.dropna(
-            subset=["SUDS_beforeExp", "SUDS_afterAct"]
-        )
+    rest_ci = np.array([
+    mean_ci(rest[col])[1] for col in cols
+])
 
-        baseline_mean, baseline_ci, n1 = mean_ci(
-            sub["SUDS_beforeExp"]
-        )
+    x = np.arange(len(labels))
+    width = 0.35
 
-        activity_mean, activity_ci, n2 = mean_ci(
-            sub["SUDS_afterAct"]
-        )
-
-        means = [baseline_mean, activity_mean]
-        cis = [baseline_ci, activity_ci]
-        ns = [n1, n2]
-
-        x = np.arange(2)
-
-        bars = ax.bar(
-            x, means,
-            width=0.55,
-            color=[NSA_COLOR, SA_COLOR],
-            yerr=cis,
-            capsize=6,
-            edgecolor="black",
-            linewidth=0.5,
-            zorder=3
-        )
-
-        add_labels(ax, bars, means, cis, ns, offset=1)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(
-            ["Baseline", activity],
-            fontsize=10
-        )
-
-        ax.set_ylabel("Mean SUDS score (0–100)")
-        ax.set_title(
-            f"{activity} (n={len(sub)})",
-            fontsize=12
-        )
-
-        ax.set_ylim(0, 100)
-        style_axis(ax)
-
-    fig.suptitle(
-        "Self-reported distress: Baseline vs Speech/Rest",
-        fontsize=14
+    plt.figure(figsize=(9, 5))
+    plt.bar(
+        x - width/2, stressed_means, width,
+        yerr=stressed_ci, capsize=4,
+        label="Stressed", color="#D55E00"
+    )
+    plt.bar(
+        x + width/2, rest_means, width,
+        yerr=rest_ci, capsize=4,
+        label="Rest/Control", color="#0072B2"
     )
 
-    fig.text(
-        0.02, 0.01,
-        "Error bars represent 95% confidence intervals. "
-        "Speech corresponds to Stressed condition; "
-        "Rest corresponds to Control condition.",
-        fontsize=8
-    )
-
-    fig.tight_layout(rect=[0, 0.05, 1, 0.94])
-
-    path = OUTPUT_DIR / "fig4_baseline_speech_rest_suds.png"
-
-    fig.savefig(path, dpi=300, bbox_inches="tight")
-
-    print(f"Saved: {path}")
-
-    if SHOW_FIGURES:
-        plt.show()
-
-    plt.close(fig)
+    plt.xticks(x, labels)
+    plt.ylabel("Mean SR (SUDS)")
+    plt.title("Mean SR – Stressed vs Rest/Control")
+    plt.legend()
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "fig6_mean_sr_comparison.png", dpi=300)
+    plt.close()
 
 def main():
     print(f"Input CSV: {CSV_PATH}")
@@ -522,7 +541,9 @@ def main():
     figure1_sias(df)
     figure2_overall(df)
     figure3_group_comparison(df)
-    figure4_baseline_speech_rest(df)
+    figure4_mean_sr_stressed(df)
+    figure5_mean_sr_rest(df)
+    figure6_mean_sr_comparison(df)
     summary = save_summary(df)
 
     # NEW: SD + 95% CI + publication-ready LaTeX table
