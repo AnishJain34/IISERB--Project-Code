@@ -113,7 +113,7 @@ def feature_extraction(eda_cleaned, df_eda_mav, sr):
     features["SCR_mean_area"] = float(np.mean(scr_areas)) if scr_areas else 0
 
     if pywt is not None:
-        for freq in [4, 2, 1]:
+        for freq in [4]:
             coeffs = pywt.wavedec(phasic, "db4", level=int(np.log2(sampling_rate / freq)))
             features[f"phasic_wavelet_{freq}Hz_mean"] = np.mean(coeffs[-1])
             features[f"phasic_wavelet_{freq}Hz_median"] = np.median(coeffs[-1])

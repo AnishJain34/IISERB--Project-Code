@@ -555,3 +555,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+#                      Total Recruited / Registered Cohort
+#                                 (N ≈ 250)
+#                                     │
+#        ┌────────────────────────────┴───────────────────────────┐
+#        ▼                                                        ▼
+# Physiological Data Files                               Self-Report Questionnaires
+#  (Baseline, 2-Back, SR)                                    (SIAS & DASS-21)
+#        (N = 198)                                               (N = 170)
+#        │                                                        │
+#        │   53 excluded:                                         │   25 excluded:
+#        │   - 28: Missing SIAS (SA/NSA = NaN)                    │   - 14: Missing EDA files
+#        │   - 25: Missing full DASS/SIAS                         │   -  6: Sync/Timeline mismatch
+#        │                                                        │   -  5: Unusable PPG / No peaks
+#        └────────────────────────────┬───────────────────────────┘
+#                                     ▼
+#                     Final Multimodal Analysis Cohort
+#                         (N = 145 Participants)
+#                        [52 SA  |  93 NSA]
