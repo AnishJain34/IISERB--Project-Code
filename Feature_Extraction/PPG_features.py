@@ -1,8 +1,17 @@
-#PPG Feature Extraction
-#Some Limits are set to avoid artifacts
-from pathlib import Path
+# ==============================================================================
+# PPG HRV FEATURE EXTRACTION (EXACT SAME FORMAT AS NILESH'S PIPELINE)
+#
+# Output CSV Format:
+#   source_file | window_index | window_start_sec | window_end_sec | HRV_MeanNN ...
+#
+# Output File Structure:
+#   output_folder / PID / subfolder / <original_name>_features.csv
+# ==============================================================================
+
+import os
 import re
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,460 +19,304 @@ import neurokit2 as nk
 
 warnings.filterwarnings("ignore")
 
-INPUT_FOLDER = Path(r"D:\automate\EDA_Phase")
-OUTPUT_FOLDER = Path(r"D:\EDA_DATA\Features_PPG")
-OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-WINDOW_SEC = 60
-OVERLAP_SEC = 45
-STEP_SEC = WINDOW_SEC - OVERLAP_SEC
-FIXED_FS = None                 # None = automatically estimate sampling rate from timestamps; set fixed Hz only if sampling rate is known and timestamps are reliable
-MAX_MISSING_FRACTION = 0.50      # Allow up to 50% missing samples in a window; above this, reject the window
-MIN_VALID_IBI = 5                # Require at least 5 valid inter-beat intervals (IBIs) before calculating NeuroKit HRV features
-MIN_IBI_SEC, MAX_IBI_SEC = 0.30, 2.00  # Accept IBIs between 0.30–2.00 s (approximately 30–200 BPM); reject implausible intervals
-MIN_FS_HZ = 20.0                 # Reject recordings with estimated sampling rate <20 Hz; helps detect incorrect/whole-second timestamps   # a PPG sampling rate below this means the timestamps are wrong
+# ---------------- Feature Functions (Pure NeuroKit2) ---------------- #
 
-# Raw PPG signal = the "PPG_A13" column (e.g. P7_PPG_A13_CAL).  If it is missing the file
-# FAILS instead of silently using PPG_IBI / PPGtoHR (which are NOT raw signals).
-PPG_SIGNAL_KEY = "ppga13"       # normalised name fragment of the raw PPG column
-
-SKIP_FILES = {
-    "ppg_all_participants_all_phases.csv",
-    "ppg_file_audit.csv",
-    "ppg_failed_files.csv",
-}
+def hrv_feature_time(rpeaks, sr):
+    return nk.hrv_time(rpeaks, sampling_rate=sr)
 
 
-# ------------------------- SMALL HELPERS -------------------------
-
-def norm(value):
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+def hrv_feature_freq(rpeaks, sr):
+    return nk.hrv_frequency(rpeaks, sampling_rate=sr, psd_method="welch")
 
 
-def find_column(df, names):
-    """Exact (normalised) name match."""
-    lookup = {norm(c): c for c in df.columns}
-    return next((lookup[norm(n)] for n in names if norm(n) in lookup), None)
+def hrv_feature_nonlinear(rpeaks, sr):
+    return nk.hrv_nonlinear(rpeaks, sampling_rate=sr)
 
+
+def hrv_feature_rqa(rpeaks, sr):
+    try:
+        return nk.hrv_rqa(rpeaks, sampling_rate=sr)
+    except Exception:
+        return pd.DataFrame()
+
+
+def determine_ppg_peaks(ppg_signal, sr):
+    """
+    Standard PPG peak detection using Elgendi method.
+    Replaces ecg.hamilton_segmenter to properly detect systolic peaks on PPG.
+    """
+    # 1. Bandpass filter & baseline removal optimized for PPG (0.5 - 8.0 Hz)
+    clean_signal = nk.ppg_clean(ppg_signal, sampling_rate=sr, method="elgendi")
+
+    # 2. Systolic peak detection
+    _, peak_info = nk.ppg_peaks(clean_signal, sampling_rate=sr, method="elgendi", show=False)
+    peaks = np.unique(np.asarray(peak_info.get("PPG_Peaks", []), dtype=int))
+    peaks = peaks[(peaks >= 0) & (peaks < len(clean_signal))]
+
+    return clean_signal, peaks
+
+
+# ---------------- Column Auto-Detection Helpers ---------------- #
 
 def find_timestamp_column(df):
-    """
-    Works with participant-prefixed Shimmer names such as
-    'P7_Timestamp_FormattedUnix_CAL'.  A column whose name contains 'timestamp' is used;
-    the human-readable 'Formatted' column is preferred over a raw Unix number.
-    """
-    candidates = [c for c in df.columns if "timestamp" in norm(c)]
-    if not candidates:
-        candidates = [c for c in df.columns
-                      if norm(c) in {"time", "datetime", "utctime"}]
-    if not candidates:
-        return None
-    formatted = [c for c in candidates if "formatted" in norm(c)]
-    return (formatted or candidates)[0]
-
-
-def find_ppg_column(df, timestamp_col):
-    """Raw PPG signal: the column containing 'PPG_A13' (e.g. P7_PPG_A13_CAL)."""
-    matches = [c for c in df.columns if c != timestamp_col and PPG_SIGNAL_KEY in norm(c)]
-    for col in matches:
-        if pd.to_numeric(df[col], errors="coerce").notna().sum() > 10:
-            return col
-    return None
-
-
-def find_optional_column(df, fragment, exclude=()):
+    """Return the column whose name contains 'Timestamp' (case-insensitive)."""
     for col in df.columns:
-        n = norm(col)
-        if fragment in n and not any(e in n for e in exclude):
+        if "timestamp" in col.lower():
             return col
-    return None
+    for col in df.columns:
+        if col.lower() in {"time", "datetime", "utctime"}:
+            return col
+    raise ValueError(f"No Timestamp column found. Available columns: {df.columns.tolist()[:10]}")
 
 
-def column_participant_prefix(columns):
-    """'P7_PPG_A13_CAL' -> 'P7' (used only to cross-check the folder name)."""
-    for c in columns:
-        m = re.match(r"^(P\d+)_", str(c), flags=re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
-    return None
+def find_ppg_column(df, time_col):
+    """
+    Auto-detect raw PPG signal column.
+    Prefers PPG_A13 (e.g. P7_PPG_A13_CAL) and avoids device-calculated heart rate columns.
+    """
+    # First look for PPG_A13
+    for col in df.columns:
+        if col != time_col and "ppg" in col.lower() and "a13" in col.lower():
+            if pd.to_numeric(df[col], errors="coerce").notna().sum() > 10:
+                return col
+
+    # Fallback to any PPG column that is not device HR
+    for col in df.columns:
+        if col != time_col and "ppg" in col.lower() and not any(x in col.lower() for x in ["hr", "ibi"]):
+            if pd.to_numeric(df[col], errors="coerce").notna().sum() > 10:
+                return col
+
+    raise ValueError(f"No valid raw PPG column found. Available columns: {df.columns.tolist()[:10]}")
 
 
-def parse_time(series):
-    """Formatted strings (day-first, as in the Arya exports) or numeric Unix time."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().mean() > 0.95:                         # numeric Unix timestamp
-        med = float(numeric.dropna().abs().median())
-        unit = "ms" if med > 1e11 else "s"
-        return pd.to_datetime(numeric, unit=unit, errors="coerce", utc=True)
-    text = series.astype("string").str.strip()
-    try:
-        parsed = pd.to_datetime(text, format="mixed", dayfirst=True, errors="coerce", utc=True)
-    except (TypeError, ValueError):
-        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce", utc=True)
-    return parsed
+# ---------------- Signal Loader & Sampling Rate ---------------- #
 
-
-def participant_phase(path):
-    rel = path.relative_to(INPUT_FOLDER)
-    participant = rel.parts[0] if len(rel.parts) > 1 else "Unknown"
-    name = path.stem.lower()
-
-    if "baseline" in name:
-        phase = "Baseline"
-    elif "speech" in name and ("rest" in name or "stress" in name):
-        phase = "SpeechRest"
-    elif any(x in name for x in ("2backpart1", "2back_part1", "2back1")):
-        phase = "2Backpart1"
-    elif any(x in name for x in ("2backpart2", "2back_part2", "2back2")):
-        phase = "2Backpart2"
-    elif "2back" in name:
-        phase = "2Back"
-    elif "summary" in name:
-        phase = "Summary"
-    else:
-        phase = path.stem
-    return participant, phase
-
-
-def load_recording(path):
-    df = pd.read_csv(path, low_memory=False)
+def load_ppg_signal(file_path):
+    """
+    Load a single PPG CSV and auto-detect Timestamp, PPG column, and Sampling Rate.
+    Replaces the local 'src' (sampling_rate_calculator) dependency.
+    """
+    df = pd.read_csv(file_path, low_memory=False)
 
     time_col = find_timestamp_column(df)
-    if time_col is None:
-        raise ValueError(f"Timestamp column not found. Columns: {list(df.columns)[:12]}")
-
     ppg_col = find_ppg_column(df, time_col)
-    if ppg_col is None:
-        raise ValueError("Raw PPG column (PPG_A13) not found or empty. "
-                         f"Columns: {list(df.columns)[:12]}")
 
-    # optional device-computed heart rate (Shimmer PPGtoHR) for quality control only
-    hr_col = find_optional_column(df, "ppgtohr")
+    # 1. Parse timestamps reliably
+    numeric = pd.to_numeric(df[time_col], errors="coerce")
+    if numeric.notna().mean() > 0.95:
+        med = float(numeric.dropna().abs().median())
+        unit = "ms" if med > 1e11 else "s"
+        timestamps = pd.to_datetime(numeric, unit=unit, errors="coerce", utc=True)
+    else:
+        text = df[time_col].astype(str).str.strip()
+        try:
+            timestamps = pd.to_datetime(text, format="mixed", dayfirst=True, errors="coerce", utc=True)
+        except Exception:
+            timestamps = pd.to_datetime(text, dayfirst=True, errors="coerce", utc=True)
 
-    frame = pd.DataFrame({
-        "time": parse_time(df[time_col]),
-        "ppg": pd.to_numeric(df[ppg_col], errors="coerce"),
-    })
-    if hr_col is not None:
-        hr = pd.to_numeric(df[hr_col], errors="coerce")
-        frame["device_hr"] = hr.where((hr >= 30) & (hr <= 220))   # drop invalid / sentinel values
+    df["_parsed_time"] = timestamps
+    df = df.dropna(subset=["_parsed_time", ppg_col]).sort_values("_parsed_time")
 
-    n_bad_time = int(frame["time"].isna().sum())
-    frame = frame.dropna(subset=["time", "ppg"]).sort_values("time")
-    agg = {"ppg": "mean"}
-    if "device_hr" in frame:
-        agg["device_hr"] = "mean"
-    data = frame.groupby("time", as_index=False).agg(agg)
-
-    if len(data) < 100:
-        raise ValueError(f"Too few valid PPG samples (unparsed timestamps: {n_bad_time})")
-
-    t = data.time
-    # total_seconds() is independent of the datetime resolution (pandas >= 3 no longer defaults to ns)
-    seconds = (t - t.iloc[0]).dt.total_seconds().to_numpy()
+    # 2. Compute sampling rate
+    seconds = (df["_parsed_time"] - df["_parsed_time"].iloc[0]).dt.total_seconds().to_numpy()
     diffs = np.diff(seconds)
     diffs = diffs[diffs > 0]
-    if not len(diffs):
-        raise ValueError("Invalid timestamps")
+    if len(diffs) == 0:
+        raise ValueError("Invalid timestamps: cannot estimate sampling rate.")
 
-    fs = float(FIXED_FS or 1 / np.median(diffs))
-    if fs < MIN_FS_HZ:
-        raise ValueError(f"Implausible PPG sampling rate {fs:.2f} Hz - check timestamp column "
-                         "(whole-second timestamps cannot be used)")
-    duration = seconds[-1]
-    count = int(np.floor(duration * fs)) + 1
-    grid = np.arange(count) / fs
-    signal = np.interp(grid, seconds, data.ppg.to_numpy())
+    sampling_rate = float(round(1.0 / np.median(diffs), 2))
 
-    typical = np.median(diffs)
-    gaps = np.diff(seconds)
-    missing_fraction = min(1.0, gaps[gaps > max(2.5 / fs, 2.5 * typical)].sum() / duration)
+    # 3. Regularize signal grid (interpolating minor sensor jitter)
+    count = int(np.floor(seconds[-1] * sampling_rate)) + 1
+    grid = np.arange(count) / sampling_rate
+    ppg_signal = np.interp(grid, seconds, pd.to_numeric(df[ppg_col], errors="coerce").to_numpy())
 
-    qc = None
-    if "device_hr" in data and data["device_hr"].notna().sum() > 10:
-        qc = (seconds, data["device_hr"].to_numpy())
-    return signal, fs, t.iloc[0], missing_fraction, ppg_col, qc
+    return ppg_signal, sampling_rate
 
 
-# ------------------------- DYNAMIC FEATURE EXTRACTION -------------------------
+# ---------------- HRV Extraction Modes ---------------- #
 
-def add_neurokit_features(features, peaks, fs):
-    """Add all columns returned by the installed NeuroKit2 version."""
-    peak_info = {"PPG_Peaks": np.asarray(peaks, dtype=int)}
-    for function_name in ("hrv_time", "hrv_frequency", "hrv_nonlinear", "hrv_rqa"):
-        function = getattr(nk, function_name, None)
-        if function is None:
-            continue
-        try:
-            result = function(peak_info, sampling_rate=fs, show=False)
-            if isinstance(result, pd.DataFrame) and not result.empty:
-                features.update(result.iloc[0].to_dict())
-        except Exception:
-            pass
+def extract_hrv_from_signal(ppg_signal, sampling_rate):
+    """Extract all HRV features from a PPG segment. Returns a one-row DataFrame."""
+    _, rpeaks = determine_ppg_peaks(ppg_signal, sampling_rate)
 
+    if len(rpeaks) < 5:
+        raise ValueError(f"Too few pulse peaks detected ({len(rpeaks)} peaks).")
 
-def extract_features(window, fs):
-    x = np.asarray(window, dtype=float)
-    features = {
-        "PPG_Raw_Sample_Count": len(x),
-        "Missing_Data_Percent": float((~np.isfinite(x)).mean() * 100)
-    }
+    # Filter out non-physiological inter-beat intervals (<30 BPM or >200 BPM)
+    ibi = np.diff(rpeaks) / sampling_rate
+    valid_mask = (ibi >= 0.30) & (ibi <= 2.00)
+    if valid_mask.sum() < 5:
+        raise ValueError("Too few valid inter-beat intervals in physiological range.")
 
-    if len(x) < int(WINDOW_SEC * fs * 0.8):
-        return features, "FAILED", "Too few samples"
+    t_df = hrv_feature_time(rpeaks, sampling_rate)
+    f_df = hrv_feature_freq(rpeaks, sampling_rate)
+    nl_df = hrv_feature_nonlinear(rpeaks, sampling_rate)
+    rqa_df = hrv_feature_rqa(rpeaks, sampling_rate)
 
-    valid = np.flatnonzero(np.isfinite(x))
-    if len(valid) < 10 or features["Missing_Data_Percent"] / 100 > MAX_MISSING_FRACTION:
-        return features, "FAILED", "Insufficient valid signal"
-
-    x = np.interp(np.arange(len(x)), valid, x[valid])
-    try:
-        clean = nk.ppg_clean(x, sampling_rate=fs, method="elgendi")
-        _, info = nk.ppg_peaks(clean, sampling_rate=fs, method="elgendi", show=False)
-        peaks = np.unique(np.asarray(info.get("PPG_Peaks", []), dtype=int))
-        peaks = peaks[(peaks >= 0) & (peaks < len(clean))]
-    except Exception as exc:
-        return features, "FAILED", f"PPG processing failed: {exc}"
-
-    features.update({
-        "PPG_Clean_Sample_Count": len(clean),
-        "PPG_Clean_Mean": float(np.mean(clean)),
-        "PPG_Clean_SD": float(np.std(clean, ddof=1)),
-        "PPG_Pulse_Peak_Count": len(peaks),
-        "PPG_Peak_Rate_per_sec": len(peaks) / (len(clean) / fs)
-    })
-
-    # Pulse-to-pulse intervals and rate statistics
-    ibi = np.diff(peaks) / fs if len(peaks) > 1 else np.array([])
-    valid_ibi = ibi[(ibi >= MIN_IBI_SEC) & (ibi <= MAX_IBI_SEC)]
-    features["IBI_Raw_Count"] = len(ibi)
-    features["IBI_Valid_Count"] = len(valid_ibi)
-
-    if len(valid_ibi):
-        hr = 60 / valid_ibi
-        features.update({
-            "PPI_ms_mean": float(np.mean(valid_ibi) * 1000),
-            "HR_mean": float(np.mean(hr)),
-            "PPG_Heart_Rate_Min_bpm": float(np.min(hr)),
-            "PPG_Heart_Rate_Max_bpm": float(np.max(hr))
-        })
-        if len(valid_ibi) > 1:
-            features.update({
-                "PPI_ms_std": float(np.std(valid_ibi, ddof=1) * 1000),
-                "HR_std": float(np.std(hr, ddof=1)),
-                "HR_Acceleration": float(np.mean(np.diff(hr))),
-                "HRV_RMSSD_ms": float(np.sqrt(np.mean(np.diff(valid_ibi * 1000) ** 2)))
-            })
-
-    # NeuroKit2 expects consecutive peaks. Use it only when every interval is valid,
-    # avoiding artificial intervals across rejected gaps.
-    if len(valid_ibi) >= MIN_VALID_IBI and len(valid_ibi) == len(ibi):
-        add_neurokit_features(features, peaks, fs)
-
-    # Pulse morphology: trough-to-peak rise and peak-to-next-peak fall
-    morphology = {"amplitude": [], "rise": [], "fall": [], "duration": [], "downstroke": []}
-    for i in range(1, len(peaks) - 1):
-        prev_peak, peak, next_peak = peaks[i - 1:i + 2]
-        trough = prev_peak + np.argmin(clean[prev_peak:peak + 1])
-        if trough >= peak:
-            continue
-        rise, fall = (peak - trough) / fs, (next_peak - peak) / fs
-        morphology["amplitude"].append(clean[peak] - clean[trough])
-        morphology["rise"].append(rise)
-        morphology["fall"].append(fall)
-        morphology["duration"].append(rise + fall)
-        if fall > 0:
-            morphology["downstroke"].append((clean[next_peak] - clean[peak]) / fall)
-
-    for name, values in morphology.items():
-        if values:
-            label = {
-                "amplitude": "PPG_Amplitude",
-                "rise": "PPG_RiseTime_s",
-                "fall": "PPG_FallTime_s",
-                "duration": "PPG_PulseDuration_s",
-                "downstroke": "PPG_DownstrokeSlope"
-            }[name]
-            features[f"{label}_mean"] = float(np.mean(values))
-            if len(values) > 1:
-                features[f"{label}_std"] = float(np.std(values, ddof=1))
-
-    first = np.diff(clean) * fs
-    second = np.diff(first) * fs
-    features["PPG_FirstDerivative_std"] = float(np.std(first, ddof=1))
-    features["PPG_SecondDerivative_std"] = float(np.std(second, ddof=1))
-
-    if len(peaks) < 2:
-        return features, "WARNING", "Too few detected pulse peaks"
-    return features, "OK", ""
+    feats = pd.concat([t_df, f_df, nl_df, rqa_df], axis=1)
+    return feats
 
 
-# ------------------------- PROCESS ONE FILE -------------------------
-
-def process_file(path):
-    participant, phase = participant_phase(path)
-    signal, fs, start_time, missing, ppg_col, qc = load_recording(path)
-    prefix = column_participant_prefix([ppg_col])
-    if prefix and participant != "Unknown" and prefix.upper() != participant.upper():
-        print(f"  WARNING: folder says {participant} but column prefix says {prefix}")
-    window_n, step_n = round(WINDOW_SEC * fs), round(STEP_SEC * fs)
-    rows = []
-
-    for start in range(0, len(signal), step_n):
-        end = min(start + window_n, len(signal))
-        if end - start < window_n * 0.8:
-            break
-
-        features, status, message = extract_features(signal[start:end], fs)
-        start_sec, end_sec = start / fs, end / fs
-
-        # QC: compare our PPG-derived heart rate with the device's own PPGtoHR value
-        device_hr = np.nan
-        if qc is not None:
-            t_sec, hr_dev = qc
-            lo, hi = np.searchsorted(t_sec, [start_sec, end_sec])
-            if hi - lo > 10 and np.isfinite(hr_dev[lo:hi]).any():
-                device_hr = float(np.nanmean(hr_dev[lo:hi]))
-        hr_diff = (features["HR_mean"] - device_hr
-                   if "HR_mean" in features and np.isfinite(device_hr) else np.nan)
-
-        row = {
-            "Participant": participant,
-            "Phase": phase,
-            "Source_File": path.name,
-            "PPG_Source_Column": ppg_col,
-            "Window_Index": len(rows),
-            "window_start_sec": start_sec,
-            "window_end_sec": end_sec,
-            "Window_Start": (start_time + pd.to_timedelta(start_sec, unit="s")).isoformat(),
-            "Window_End": (start_time + pd.to_timedelta(end_sec, unit="s")).isoformat(),
-            "Sampling_Rate_Hz": fs,
-            "Window_Duration_s": (end - start) / fs,
-            "Recording_Missing_Data_Percent": missing * 100,
-            "Device_HR_mean_bpm": device_hr,
-            "HR_minus_Device_HR_bpm": hr_diff,
-            "Processing_Status": status,
-            "Processing_Message": message,
-            **features
-        }
-        rows.append(row)
-        if end == len(signal):
-            break
-
-    return pd.DataFrame(rows), participant, phase, ppg_col, fs
+def process_full_segment(ppg_signal, sampling_rate):
+    """
+    Extract HRV features from the entire PPG signal as one segment.
+    Returns a one-row DataFrame.
+    """
+    feats = extract_hrv_from_signal(ppg_signal, sampling_rate)
+    feats.insert(0, "window_index", 0)
+    feats.insert(1, "window_start_sec", 0.0)
+    feats.insert(2, "window_end_sec", round(len(ppg_signal) / sampling_rate, 3))
+    return feats
 
 
-# ------------------------- TEST ONE PARTICIPANT -------------------------
+def process_windowed(ppg_signal, sampling_rate, window_size_sec=60, overlap_sec=45):
+    """
+    Extract HRV features using a sliding window approach.
+    Returns a DataFrame with one row per window matching the Nilesh pipeline format.
+    """
+    if overlap_sec >= window_size_sec:
+        raise ValueError("overlap_sec must be strictly less than window_size_sec.")
 
-# ------------------------- TEST ALL PARTICIPANTS -------------------------
-
-def main():
-    if not INPUT_FOLDER.exists():
-        raise FileNotFoundError(INPUT_FOLDER)
-
-    files = [
-        p for p in sorted(INPUT_FOLDER.rglob("*.csv"))
-        if p.name.lower() not in SKIP_FILES
-        and not p.name.lower().endswith("_features.csv")
-        and "phase_summary" not in p.name.lower()
-        and OUTPUT_FOLDER.resolve() not in p.resolve().parents
-    ]
+    window_samples = int(window_size_sec * sampling_rate)
+    step_samples = int((window_size_sec - overlap_sec) * sampling_rate)
 
     all_rows = []
-    audit = []
-    failed = []
+    feature_columns = None
+    win_idx = 0
+    start = 0
 
-    print(f"Total raw files found: {len(files)}")
-
-    for i, path in enumerate(files, 1):
-        print(f"\n[{i}/{len(files)}] {path}")
+    while start + window_samples <= len(ppg_signal):
+        end = start + window_samples
+        segment = ppg_signal[start:end]
+        start_sec = round(start / sampling_rate, 3)
+        end_sec = round(end / sampling_rate, 3)
 
         try:
-            result, participant, phase, ppg_col, fs = process_file(path)
+            feats = extract_hrv_from_signal(segment, sampling_rate)
 
-            folder = OUTPUT_FOLDER / participant
-            folder.mkdir(parents=True, exist_ok=True)
+            if feature_columns is None:
+                feature_columns = feats.columns.tolist()
 
-            phase_name = re.sub(
-                r"[^A-Za-z0-9_-]+", "_", phase
-            )
+            row = feats.iloc[0].to_dict()
+            row["window_index"] = win_idx
+            row["window_start_sec"] = start_sec
+            row["window_end_sec"] = end_sec
+            all_rows.append(row)
 
-            output = folder / f"{phase_name}_PPG_PRV_Features.csv"
+        except Exception as e:
+            # When peak detection fails in a noisy window, record NaN to maintain window indexing
+            if feature_columns is not None:
+                nan_row = {col: np.nan for col in feature_columns}
+                nan_row["window_index"] = win_idx
+                nan_row["window_start_sec"] = start_sec
+                nan_row["window_end_sec"] = end_sec
+                all_rows.append(nan_row)
 
-            result.to_csv(output, index=False)
-            all_rows.append(result)
+        start += step_samples
+        win_idx += 1
 
-            audit.append({
-                "Source_File": str(path),
-                "Participant": participant,
-                "Phase": phase,
-                "Sampling_Rate_Hz": fs,
-                "Windows": len(result),
-                "Status": "OK",
-                "Output_File": str(output)
-            })
+    if not all_rows:
+        return pd.DataFrame()
 
-        except Exception as exc:
-            print(f"FAILED: {exc}")
+    final_df = pd.DataFrame(all_rows)
+    cols_order = ["window_index", "window_start_sec", "window_end_sec"] + [
+        c for c in feature_columns if c in final_df.columns
+    ]
+    final_df = final_df[cols_order]
+    return final_df
 
-            participant, phase = participant_phase(path)
 
-            failed.append({
-                "Source_File": str(path),
-                "Error": str(exc)
-            })
+# ---------------- Main Batch Pipeline ---------------- #
 
-            audit.append({
-                "Source_File": str(path),
-                "Participant": participant,
-                "Phase": phase,
-                "Status": "FAILED",
-                "Message": str(exc)
-            })
+def extract_ppg_hrv_features_for_all_participants(
+    input_folder,
+    output_folder,
+    mode="window",
+    window_size_sec=60,
+    overlap_sec=45
+):
+    """
+    Walks through input_folder/PID, extracts HRV features from raw PPG,
+    and saves each CSV as '<original_name>_features.csv' under output_folder/PID.
+    """
+    input_path = Path(input_folder)
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(audit).to_csv(
-        OUTPUT_FOLDER / "PPG_FILE_AUDIT.csv",
-        index=False
-    )
+    pid_folders = sorted([
+        d for d in input_path.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    ])
 
-    pd.DataFrame(failed).to_csv(
-        OUTPUT_FOLDER / "PPG_FAILED_FILES.csv",
-        index=False
-    )
+    if not pid_folders:
+        print("No participant subfolders found in the input folder.")
+        return
 
-    if all_rows:
-        combined = pd.concat(
-            all_rows, ignore_index=True, sort=False
-        )
+    for pid_dir in pid_folders:
+        pid = pid_dir.name
+        pid_output_path = output_path / pid
+        pid_output_path.mkdir(parents=True, exist_ok=True)
 
-        combined.to_csv(
-            OUTPUT_FOLDER / "PPG_ALL_PARTICIPANTS_ALL_PHASES.csv",
-            index=False
-        )
+        print(f"\n{'='*60}")
+        print(f"  Participant: {pid}")
+        print(f"{'='*60}")
 
-        print("\n========== SUMMARY ==========")
-        print("Successful files:", len(all_rows))
-        print("Failed files:", len(failed))
-        print("Total windows:", len(combined))
+        csv_files = sorted(pid_dir.rglob("*.csv"))
+        if not csv_files:
+            print(f"  No CSV files found under {pid_dir}")
+            continue
 
-        print("\nParticipants:")
-        print(combined["Participant"].nunique())
+        for file_path in csv_files:
+            if file_path.name.endswith("_features.csv"):
+                continue
 
-        print("\nWindows per participant and phase:")
-        print(combined.groupby(["Participant", "Phase"]).size())
+            rel_path = file_path.relative_to(pid_dir)
+            out_name = f"{file_path.stem}_features.csv"
+            out_dir = pid_output_path / rel_path.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / out_name
 
-        print("\nProcessing status:")
-        print(combined["Processing_Status"].value_counts())
+            print(f"  Processing : {rel_path}")
 
-    else:
-        print("No files processed successfully.")
+            try:
+                ppg_signal, sampling_rate = load_ppg_signal(file_path)
 
-    print(f"\nOutput folder: {OUTPUT_FOLDER}")
+                if mode == "full":
+                    result_df = process_full_segment(ppg_signal, sampling_rate)
+                elif mode == "window":
+                    result_df = process_windowed(
+                        ppg_signal,
+                        sampling_rate,
+                        window_size_sec=window_size_sec,
+                        overlap_sec=overlap_sec
+                    )
+                else:
+                    raise ValueError(f"Unknown mode '{mode}'. Choose 'full' or 'window'.")
 
+                if result_df.empty:
+                    print("    Warning: No windows extracted.")
+                    continue
+
+                # Insert source_file at index 0 to match Nilesh's format exactly
+                result_df.insert(0, "source_file", str(rel_path).replace("\\", "/"))
+                result_df.to_csv(out_file, index=False)
+                print(f"    Saved ({len(result_df)} windows) -> {out_file.name}")
+
+            except Exception as e:
+                print(f"    FAILED : {e}")
+
+    print(f"\nDone. All feature files saved under: {output_folder}")
+
+
+# ---------------- Execution ---------------- #
 
 if __name__ == "__main__":
-    main()
-
-
-
-
+    extract_ppg_hrv_features_for_all_participants(
+        input_folder    = r"D:\automate\EDA_Phase",
+        output_folder   = r"D:\EDA_DATA\Features_PPG",
+        mode            = "window",
+        window_size_sec = 60,    # 60-second window
+        overlap_sec     = 45     # 45-second overlap (15-second step)
+    )
